@@ -30,6 +30,7 @@ import org.apache.http.client.methods.AbortableHttpRequest;
 import org.apache.http.client.utils.URIUtils;
 import org.apache.http.config.SocketConfig;
 import org.apache.http.entity.InputStreamEntity;
+import org.apache.http.impl.NoConnectionReuseStrategy;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.message.BasicHeader;
 import org.apache.http.message.BasicHttpEntityEnclosingRequest;
@@ -112,6 +113,15 @@ public class ProxyServlet extends HttpServlet {
           ProxyServlet.class.getSimpleName() + ".targetUri";
   protected static final String ATTR_TARGET_HOST =
           ProxyServlet.class.getSimpleName() + ".targetHost";
+  /** proxy host to be used for the current request, all proxy attributes must be set  **/
+  protected static final String ATTR_REMOTE_PROXY_HOST =
+          ProxyServlet.class.getSimpleName() + ".proxyHost";
+  protected static final String ATTR_REMOTE_PROXY_PORT =
+          ProxyServlet.class.getSimpleName() + ".proxyPort";
+  protected static final String ATTR_REMOTE_PROXY_PROTOCOL =
+          ProxyServlet.class.getSimpleName() + ".proxyProtocol";
+  protected static final String ATTR_PROXY_CLIENT =
+          ProxyServlet.class.getSimpleName() + ".proxyClient";
 
   /* MISC */
 
@@ -219,20 +229,31 @@ public class ProxyServlet extends HttpServlet {
 
     initTarget();//sets target*
 
-    proxyClient = createHttpClient();
+    proxyClient = createHttpClient(null);
   }
 
-  /**
-   * Sub-classes can override specific behaviour of {@link org.apache.http.client.config.RequestConfig}.
-   */
-  protected RequestConfig buildRequestConfig() {
+
+  protected RequestConfig.Builder getRequestConfigBuilder() {
     return RequestConfig.custom()
             .setRedirectsEnabled(doHandleRedirects)
             .setCookieSpec(CookieSpecs.IGNORE_COOKIES) // we handle them in the servlet instead
             .setConnectTimeout(connectTimeout)
             .setSocketTimeout(readTimeout)
-            .setConnectionRequestTimeout(connectionRequestTimeout)
-            .build();
+            .setConnectionRequestTimeout(connectionRequestTimeout);
+  }
+
+  /**
+   * Sub-classes can override specific behaviour of {@link org.apache.http.client.config.RequestConfig}.
+   */
+  protected RequestConfig buildRequestConfig(HttpServletRequest servletRequest) {
+    RequestConfig.Builder builder = getRequestConfigBuilder();
+    if ( (servletRequest != null) && (servletRequest.getAttribute(ATTR_REMOTE_PROXY_HOST) != null)) {
+        final HttpHost proxyHost = new HttpHost(""+servletRequest.getAttribute(ATTR_REMOTE_PROXY_HOST), 
+          Integer.valueOf(servletRequest.getAttribute(ATTR_REMOTE_PROXY_PORT)+""),
+          ""+servletRequest.getAttribute(ATTR_REMOTE_PROXY_PROTOCOL));
+        return builder.setProxy(proxyHost).build();
+    }
+    return builder.build();
   }
 
   /**
@@ -267,9 +288,10 @@ public class ProxyServlet extends HttpServlet {
    * HttpClient offers many opportunities for customization.
    * In any case, it should be thread-safe.
    */
-  protected HttpClient createHttpClient() {
-    HttpClientBuilder clientBuilder = getHttpClientBuilder()
-                                        .setDefaultRequestConfig(buildRequestConfig())
+  protected HttpClient createHttpClient(HttpServletRequest servletRequest) {
+    HttpClientBuilder clientBuilder = HttpClientBuilder.create()
+                                        .setDefaultRequestConfig(buildRequestConfig(servletRequest))
+                                        .setConnectionReuseStrategy(new NoConnectionReuseStrategy())
                                         .setDefaultSocketConfig(buildSocketConfig());
 
     clientBuilder.setMaxConnTotal(maxConnections);
@@ -313,20 +335,24 @@ public class ProxyServlet extends HttpServlet {
     return proxyClient;
   }
 
-  @Override
-  public void destroy() {
+  protected void close(HttpClient pClient) {
     //Usually, clients implement Closeable:
-    if (proxyClient instanceof Closeable) {
+    if (pClient instanceof Closeable) {
       try {
-        ((Closeable) proxyClient).close();
+        ((Closeable) pClient).close();
       } catch (IOException e) {
-        log("While destroying servlet, shutting down HttpClient: "+e, e);
+        log("Error while closing HttpClient: "+e, e);
       }
     } else {
       //Older releases require we do this:
-      if (proxyClient != null)
-        proxyClient.getConnectionManager().shutdown();
+      if (pClient != null)
+        pClient.getConnectionManager().shutdown();
     }
+  }
+
+  @Override
+  public void destroy() {
+    close(proxyClient);
     super.destroy();
   }
 
@@ -392,6 +418,10 @@ public class ProxyServlet extends HttpServlet {
       // make sure the entire entity was consumed, so the connection is released
       if (proxyResponse != null)
         EntityUtils.consumeQuietly(proxyResponse.getEntity());
+      if (servletRequest.getAttribute(ATTR_PROXY_CLIENT) != null) {
+          close((HttpClient)servletRequest.getAttribute(ATTR_PROXY_CLIENT));
+          servletRequest.removeAttribute(ATTR_PROXY_CLIENT);
+      }
       //Note: Don't need to close servlet outputStream:
       // http://stackoverflow.com/questions/1159168/should-one-call-close-on-httpservletresponse-getoutputstream-getwriter
     }
@@ -422,11 +452,20 @@ public class ProxyServlet extends HttpServlet {
 
   protected HttpResponse doExecute(HttpServletRequest servletRequest, HttpServletResponse servletResponse,
                                    HttpRequest proxyRequest) throws IOException {
+    final HttpHost target = getTargetHost(servletRequest);
     if (doLog) {
-      log("proxy " + servletRequest.getMethod() + " uri: " + servletRequest.getRequestURI() + " -- " +
+      log("proxy " + servletRequest.getMethod() + " " + target + " uri: " + servletRequest.getRequestURI() + " -- " +
               proxyRequest.getRequestLine().getUri());
     }
-    return proxyClient.execute(getTargetHost(servletRequest), proxyRequest);
+    if (servletRequest.getAttribute(ATTR_REMOTE_PROXY_HOST) != null) {
+      log("Using proxy " + servletRequest.getAttribute(ATTR_REMOTE_PROXY_HOST));
+      final HttpClient pClient = createHttpClient(servletRequest);
+      servletRequest.setAttribute(ATTR_PROXY_CLIENT, pClient);
+      final HttpResponse resp = pClient.execute(target, proxyRequest);
+      return resp;
+    } else {
+      return proxyClient.execute(target, proxyRequest);
+    }
   }
 
   protected HttpRequest newProxyRequestWithEntity(String method, String proxyRequestUri,
